@@ -1,0 +1,224 @@
+---
+title: "451 Final Project Code"
+author: "Owen Yoo + Owen Swisher"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Loading necessary libraries and data
+
+```{r}
+setwd("~/Documents/Final-451")
+set.seed(123)
+library(tidyverse)
+library(rstan)
+library(nflfastR)
+library(knitr)
+library(ggridges)
+library(coda)
+library(bayesplot)
+pbp <- load_pbp(2023)
+coach <- read_csv("~/Documents/Final-451/coach.csv")
+```
+
+## Manipulating data to an appropriate format
+
+```{r}
+fourth_downs <- pbp |>
+  filter(down == 4)
+
+#To obtain our n values, total number of fourth down observed in our data
+team_total_fourth <- fourth_downs |>
+  group_by(posteam) |>
+  filter(half_seconds_remaining >= 120) |>
+  summarize(total = n())
+
+team_attempted_fourth <- fourth_downs |>
+  filter(play_type == 'pass' | play_type == 'run',
+         half_seconds_remaining >= 120) |>
+  group_by(posteam) |>
+  summarize(attempted = n(),
+            avg_epa = mean(epa))
+
+fourth_combined <- team_total_fourth |>
+  left_join(team_attempted_fourth, by = 'posteam')
+
+coach$Tm <- fourth_combined$posteam
+
+fourth_combined <- fourth_combined |>
+  left_join(coach, by = c('posteam' = 'Tm')) 
+
+fourth_combined <- fourth_combined |>
+  mutate(isOld = if_else(G > 85, 1, 0))
+```
+
+## Preliminary Analysis
+
+```{r}
+sum(fourth_combined$attempted) / sum(fourth_combined$total)
+
+pre_rank <- fourth_combined |>
+  mutate(prop = attempted / total) |>
+  arrange(desc(prop))
+kable(pre_rank)
+```
+
+## STAN Setup
+
+```{r cache = TRUE}
+stan_fourth <- list(m = nrow(fourth_combined), y = fourth_combined$attempted, n = fourth_combined$total,
+                    o = fourth_combined$isOld)
+fit <- stan(file = "Final_Fourth.stan", 
+            data = stan_fourth,
+            iter = 10000, chains = 2)
+sample <- extract(fit)
+theta <- sample$theta
+```
+
+## STAN convergence
+
+```{r}
+effectiveSize(theta)
+stan_trace(fit)
+converge_data <- data.frame(ESS_theta = mean(effectiveSize(theta)),
+                            ESS_alpha_young = effectiveSize(c(sample$alpha_young)),
+                            ESS_alpha_old = effectiveSize(c(sample$alpha_old)),
+                            ESS_gamma_young = effectiveSize(c(sample$gamma_young)),
+                            ESS_gamma_old = effectiveSize(c(sample$gamma_old)))
+kable(converge_data)
+```
+
+## STAN Analysis
+
+```{r}
+mean_data <- colMeans(sample$theta)
+var_data <- apply(sample$theta, 2, var)
+# For our posterior interval
+lb <- apply(sample$theta, 2, quantile, probs = 0.025)
+ub <- apply(sample$theta, 2, quantile, probs = 0.975)
+team_data <- data.frame(team = fourth_combined$posteam, 
+                        coach = fourth_combined$Coach,
+                        isOld = as.logical(fourth_combined$isOld),
+                          mean = mean_data, 
+                          var = var_data,
+                          lb = lb,
+                          ub = ub,
+                        avg_epa = fourth_combined$avg_epa) |>
+  arrange(desc(mean)) |>
+  left_join(teams_colors_logos, by = c('team' = 'team_abbr'))
+
+team_data <- team_data |>
+  mutate(border = if_else(isOld, "#FFFF33", "#39FF14"))
+
+kable(team_data[, 1:6])
+```
+
+## Comparison of other Parameters
+
+```{r}
+newer <- as.vector(theta[, fourth_combined$isOld == 0]) 
+older <- as.vector(theta[, fourth_combined$isOld == 1])
+
+mean(newer > older)
+mean(sample$alpha_old)
+mean(sample$alpha_young)
+mean(sample$alpha_young > sample$alpha_old)
+mean(sample$gamma_old)
+mean(sample$gamma_young)
+mean(sample$gamma_young > sample$gamma_old)
+
+mean_data <- data.frame(Type = c('Alpha Old', 'Alpha Young', 'Gamma Old', 'Gamma Young'),
+                          `Expected Value` = c(mean(sample$alpha_old),mean(sample$alpha_young), 
+                                               mean(sample$gamma_old), mean(sample$gamma_young)))
+kable(mean_data)
+
+alpha_old <- sample$alpha_old
+gamma_old <- sample$gamma_old
+alpha_young <- sample$alpha_young
+gamma_young <- sample$gamma_young
+
+beta_data <- data.frame(`Expected Old Dist.` = mean(older),
+                        `Expected Young Dist.` = mean(newer),
+                        `Variance Old Dist.` = var(older),
+                        `Variance Young Dist` = var(newer), check.names = FALSE)
+kable(beta_data)
+
+prob_data <- data.frame(`Pr(Newer > Older)` = mean(newer > older),
+                        `Pr(Alpha Young > Alpha Old)` = mean(alpha_young > alpha_old),
+                        `Pr(Gamma Young > Gamma Old)` = mean(gamma_young > gamma_old), check.names = FALSE)
+kable(prob_data)
+
+cor(team_data$avg_epa, team_data$mean)
+```
+
+## Data Visualization
+
+```{r}
+#Ridgeline Plot
+colnames(theta) <- fourth_combined$posteam
+
+interval <- team_data |>
+  select(team, lb, ub)
+
+theta_long <- pivot_longer(as.data.frame(theta), cols = everything(), names_to = "Theta", values_to = "Value") |>
+  left_join(teams_colors_logos, by = c('Theta' = 'team_abbr')) |>
+  group_by(Theta) |>
+  mutate(mean_value = mean(Value)) |>
+  ungroup() |>
+  left_join(interval, by = c('Theta' = 'team')) |>
+  mutate(Theta = fct_reorder(Theta, mean_value))
+
+
+theta_long |>
+ggplot(aes(x = Value, y = Theta, fill = team_color)) +
+  geom_density_ridges(scale = 1.5, rel_min_height = 0.01) +
+  geom_segment(aes(x = lb, xend = lb, y = as.numeric(Theta) - 0.4, 
+                   yend = as.numeric(Theta) + 0.4, inherit.aes = FALSE), linewidth = 0.4) +
+  geom_segment(aes(x = ub, xend = ub, y = as.numeric(Theta) - 0.4, 
+                   yend = as.numeric(Theta) + 0.4, inherit.aes = FALSE), linewidth = 0.4) +
+  labs(title = "Ridgeline Plot of Monte Carlo Samples for Each Team",
+       x = "4th Down Aggressiveness Proportion", y = "Team") +
+  scale_fill_identity() +
+  theme_minimal() +
+  theme(legend.position = "none") + 
+  theme_bw()
+
+#Mean Theta + Avg EPA scatterplot
+team_data |>
+  ggplot(aes(x = mean, y = avg_epa)) +
+  geom_point(aes(fill = team_color, color = border), shape = 21, size = 4, stroke = 1.5) +
+  scale_fill_identity() +
+  scale_color_identity(aesthetics = c("fill", "color")) +
+  ggrepel :: geom_text_repel(aes(label = team)) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  labs(title = 'Comparison of Teams EPA and their Mean Theta', 
+       x = 'Mean Theta',
+       y = 'Average EPA per 4th Down attempts',
+       subtitle = 'Green = Newer Coach, Yellow = Older Coach')
+
+# Posterior by Coach Experience
+newer <- as.vector(theta[, fourth_combined$isOld == 0]) 
+older <- as.vector(theta[, fourth_combined$isOld == 1])
+combined_post <- cbind(newer, older)
+
+new_post <- quantile(newer, probs = c(0.025, 0.975))
+old_post <- quantile(older, probs = c(0.025, 0.975))
+
+combined_post |>
+  ggplot()+
+  geom_density(aes(x = newer), color = "red") +
+  geom_density(aes(x = older), color = "blue") + 
+  geom_segment(aes(x = new_post[1], xend = new_post[2], y = 0, yend = 0), color = "red", linetype = "dashed") +
+  geom_segment(aes(x = old_post[1], xend = old_post[2], y = 0, yend = 0), color = "blue", linetype = "dashed") +
+  theme_bw() + 
+  labs(title = "Comparison between Grouped Posterior Distributions",
+       subtitle = "Red = Newer, Blue = Experienced",
+       x = "4th Down Aggressiveness Proportion",
+       y = 'Density')
+
+```
